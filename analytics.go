@@ -1,6 +1,7 @@
 package analytics
 
 import "github.com/jehiah/go-strftime"
+import "github.com/segmentio/backo-go"
 import "github.com/xtgo/uuid"
 import "encoding/json"
 import "net/http"
@@ -14,6 +15,9 @@ var version = "2.0.0"
 
 // Endpoint for the Segment API.
 var Endpoint = "https://api.segment.io"
+
+// Backoff policy.
+var Backo = backo.NewBacko(time.Second*1, 2, 0.001, time.Minute*10)
 
 // DefaultContext of message batches.
 var DefaultContext = map[string]interface{}{
@@ -218,7 +222,7 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// Send batch request.
+// Send batch request, retrying if necessary.
 func (c *Client) send(msgs []interface{}) {
 	if len(msgs) == 0 {
 		return
@@ -236,11 +240,24 @@ func (c *Client) send(msgs []interface{}) {
 		return
 	}
 
+	for i := 0; i < 10; i++ {
+		err = c.upload(b)
+		if err == nil {
+			return
+		}
+		Backo.Sleep(i)
+	}
+
+	c.log("giving up on messages: %s", msgs)
+}
+
+// Upload serialized batch message.
+func (c *Client) upload(b []byte) error {
 	url := c.Endpoint + "/v1/batch"
 	req, err := http.NewRequest("POST", url, bytes.NewReader(b))
 	if err != nil {
 		c.log("error creating request: %s", err)
-		return
+		return err
 	}
 
 	req.Header.Add("User-Agent", "analytics-go (version: "+version+")")
@@ -251,11 +268,13 @@ func (c *Client) send(msgs []interface{}) {
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		c.log("error sending request: %s", err)
-		return
+		return err
 	}
 	defer res.Body.Close()
 
 	c.report(res)
+
+	return nil
 }
 
 // Report on response body.
@@ -287,13 +306,13 @@ func (c *Client) loop() {
 			msgs = append(msgs, msg)
 			if len(msgs) == c.Size {
 				c.verbose("exceeded %d messages – flushing", c.Size)
-				c.send(msgs)
+				go c.send(msgs)
 				msgs = nil
 			}
 		case <-tick.C:
 			if len(msgs) > 0 {
 				c.verbose("interval reached - flushing %d", len(msgs))
-				c.send(msgs)
+				go c.send(msgs)
 				msgs = nil
 			} else {
 				c.verbose("interval reached – nothing to send")
