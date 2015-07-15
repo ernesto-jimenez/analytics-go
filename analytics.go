@@ -112,6 +112,7 @@ type Client struct {
 	key      string
 	msgs     chan interface{}
 	quit     chan bool
+	executor chan []interface{}
 
 	uid func() string
 	now func() time.Time
@@ -122,6 +123,7 @@ func New(key string) *Client {
 	c := &Client{
 		msgs:     make(chan interface{}, 100),
 		quit:     make(chan bool),
+		executor: make(chan []interface{}),
 		Interval: 5 * time.Second,
 		Endpoint: Endpoint,
 		Size:     250,
@@ -131,6 +133,7 @@ func New(key string) *Client {
 	}
 
 	go c.loop()
+	go c.execute()
 
 	return c
 }
@@ -227,7 +230,7 @@ func (c *Client) send(msgs []interface{}) {
 	if len(msgs) == 0 {
 		return
 	}
-	
+
 	batch := new(Batch)
 	batch.Messages = msgs
 	batch.MessageId = c.uid()
@@ -306,23 +309,61 @@ func (c *Client) loop() {
 			msgs = append(msgs, msg)
 			if len(msgs) == c.Size {
 				c.verbose("exceeded %d messages – flushing", c.Size)
-				go c.send(msgs)
+				c.executor <- msgs
 				msgs = nil
 			}
 		case <-tick.C:
 			if len(msgs) > 0 {
 				c.verbose("interval reached - flushing %d", len(msgs))
-				go c.send(msgs)
+				c.executor <- msgs
 				msgs = nil
 			} else {
 				c.verbose("interval reached – nothing to send")
 			}
 		case <-c.quit:
 			c.verbose("exit requested – flushing %d", len(msgs))
-			c.send(msgs)
+			c.executor <- msgs
 			c.verbose("exit")
 			c.quit <- true
 			return
+		}
+	}
+}
+
+// Execute listens on the executor channel runs in its own goroutine.
+func (c *Client) execute() {
+	var queue [][]interface{}
+
+	running := 0
+	done := make(chan bool)
+
+	for {
+		select {
+		case batch := <-c.executor:
+			if running > 2 {
+				queue = append(queue, batch)
+				continue
+			}
+
+			running++
+			go func() {
+				c.send(batch)
+				done <- true
+			}()
+		case <-done:
+			running--
+			if len(queue) == 0 {
+				continue
+			}
+
+			m := queue[0]
+			queue = queue[1:]
+			running++
+
+			go func() {
+				c.send(m)
+				done <- false
+			}()
 		}
 	}
 }
