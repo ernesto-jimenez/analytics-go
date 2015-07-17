@@ -103,12 +103,14 @@ type Alias struct {
 
 // Client which batches messages and flushes at the given Interval or
 // when the Size limit is exceeded. Set Verbose to true to enable
-// logging output.
+// logging output. Set Cap to limit the number of goroutines this client can
+// create.
 type Client struct {
 	Endpoint string
 	Interval time.Duration
 	Verbose  bool
 	Size     int
+	Cap      int
 	key      string
 	msgs     chan interface{}
 	quit     chan bool
@@ -127,6 +129,7 @@ func New(key string) *Client {
 		Interval: 5 * time.Second,
 		Endpoint: Endpoint,
 		Size:     250,
+		Cap:      100,
 		key:      key,
 		now:      time.Now,
 		uid:      uid,
@@ -330,17 +333,16 @@ func (c *Client) loop() {
 	}
 }
 
-// Execute listens on the executor channel runs in its own goroutine.
+// Execute listens on the executor channel and runs in its own goroutine.
 func (c *Client) execute() {
 	var queue [][]interface{}
-
 	running := 0
 	done := make(chan bool)
 
 	for {
 		select {
 		case batch := <-c.executor:
-			if running > 2 {
+			if running > c.Cap {
 				queue = append(queue, batch)
 				continue
 			}
@@ -356,13 +358,13 @@ func (c *Client) execute() {
 				continue
 			}
 
-			m := queue[0]
+			batch := queue[0]
 			queue = queue[1:]
 			running++
 
 			go func() {
-				c.send(m)
-				done <- false
+				c.send(batch)
+				done <- true
 			}()
 		}
 	}
